@@ -1,0 +1,244 @@
+---
+title: "Introduction to MAF"
+author: Erika Li, Jeanne Revilla, Mahija Mogalipuvvu, adapted from Nicole Black, Wade Boohar
+date: 07/17/22
+updated: 9/29/2025
+---
+
+***Deliverables***
+- upload this R Notebook to your GitHub and submit the link to your Repo on Brightspace
+- include ALL graphs or figures created in this assignment in a folder with your R notebook with descriptive file names.
+
+We encourage you to work with a partner. Therefore, it is okay if your answers are the same as your partner’s as long as everyone understands it and could explain it in their own words if asked. Each person must individually push their code to Github. *At the top of your R Notebook, write the name of you and your partner(s) as a comment.*
+
+***Complete the following coding activity and answer any following questions as comments in your R Notebook***
+
+In this assignment, you will need to use your skills learned in class to demonstrate your understanding of categorical variables and R data structures.
+
+```{r}
+setwd("/home1/kwang895/490_cluster/analysis_data")
+getwd()
+```
+
+
+*Pre-Assignment*
+Load all necessary packages, read in the clinical data.csv file you have in your analysis_data folder, and instantiate the MAF_object.
+```{r}
+library(BiocManager)
+library(TCGAbiolinks)
+library(maftools)
+
+knitr::opts_knit$set(root.dir = normalizePath("/home1/kwang895/490_cluster/analysis_data"))
+
+setwd("/home1/kwang895/490_cluster/analysis_data")
+
+clinical <- read.csv("/home1/kwang895/490_cluster/analysis_data/brca_clinical_data.csv")
+
+colnames(clinical)[colnames(clinical) == "bcr_patient_barcode"] <- "Tumor_Sample_Barcode"
+
+maf_query <- GDCquery(
+  project = "TCGA-BRCA",
+  data.category = "Simple Nucleotide Variation",
+  access = "open",
+  data.type = "Masked Somatic Mutation",
+  workflow.type = "Aliquot Ensemble Somatic Variant Merging and Masking"
+)
+
+#GDCdownload(maf_query)
+
+maf <- GDCprepare(maf_query)
+
+maf_object <- read.maf(maf = maf,
+                       clinicalData = clinical,
+                       isTCGA = TRUE) 
+```
+
+It's useful to save your MAF_object, so that you don't have to go through the trouble of querying and preparing it everytime. The saveRDS function allows us to save an R object, allowing us to access it directly from our files. 
+```{r}
+saveRDS(maf_object, file = "/home1/kwang895/490_cluster/analysis_data/maf_object.rds")
+# ex. saveRDS(MAF_object, file = "/home1/erika/490_cluster/analysis_data/maf_object.rds")
+```
+
+When you reopen a new R session and want to access your MAF_object, you can use the readRDS function to load the object back into a new variable.
+```{r}
+MAF_object <- readRDS(file = "/home1/kwang895/490_cluster/analysis_data/maf_object.rds")
+# ex. MAF_object <- readRDS(file = "/home1/erika/490_cluster/analysis_data/maf_object.rds")
+```
+
+*1*
+Choose a clinical variable (or any variable from clin_rad or clin_drug) to separate your populations into two different groups and rewrite the column or create a new column with that variable as a factor. ***Do not use age or vital_status as your clinical variable.*** Hint: if your variable is continuous, you will need to determine your own cutoffs for the different levels of the factor. If your variable is categorical and has more than two possible values, choose the two that are the most common.
+```{r}
+# Clinical variable chosen: tumor_status
+# Two groups: "WITH TUMOR" vs "TUMOR FREE"
+
+# Check existing values
+table(maf_object@clinical.data$tumor_status)
+
+# Rewrite tumor_status column as a factor with two levels
+maf_object@clinical.data$tumor_status <- factor(
+  maf_object@clinical.data$tumor_status,
+  levels = c("WITH TUMOR", "TUMOR FREE")
+)
+
+# Confirm
+table(maf_object@clinical.data$tumor_status)
+
+# Make masks
+with_tumor_mask <- ifelse(maf_object@clinical.data$tumor_status == "WITH TUMOR", T, F)
+tumor_free_mask <- ifelse(maf_object@clinical.data$tumor_status == "TUMOR FREE", T, F)
+
+# Extract barcodes
+with_tumor_barcodes <- maf_object@clinical.data$Tumor_Sample_Barcode[with_tumor_mask]
+tumor_free_barcodes <- maf_object@clinical.data$Tumor_Sample_Barcode[tumor_free_mask]
+
+# Subset MAF objects
+with_tumor_maf <- subsetMaf(maf = maf_object,
+                            tsb = with_tumor_barcodes)
+tumor_free_maf <- subsetMaf(maf = maf_object,
+                            tsb = tumor_free_barcodes)
+```
+
+
+*2*
+Create a co-oncoplot with the top 10-20 (you choose) most mutated genes for the two groups. Pick one that has a large discrepancy in % mutated or type of mutations between the groups and research it. 
+Research it. What is the gene used for? Can you think of any reason for the discrepancy?
+```{r}
+# Create a co-oncoplot comparing WITH TUMOR vs TUMOR FREE patients
+# using the top 15 most mutated genes
+coOncoplot(m1 = with_tumor_maf,
+           m2 = tumor_free_maf,
+           m1Name = "With Tumor",
+           m2Name = "Tumor Free",
+           )
+```
+Gene chosen: PIK3CA
+With Tumor: 27%   
+Tumor Free: 35%   
+Discrepancy: 8%
+
+PIK3CA encodes the p110-alpha catalytic subunit of PI3K (phosphatidylinositol 3-kinase), a key enzyme in the PI3K/AKT/mTOR signaling pathway that regulates cell growth, proliferation, and survival. PIK3CA is one of the most commonly mutated oncogenes in breast cancer. Unlike tumor suppressor genes, PIK3CA mutations are gain-of-function — they constitutively activate the PI3K pathway, driving uncontrolled cell growth.
+
+There are two possible explanations for the discrepency:
+
+1. Subtype and treatment response: PIK3CA mutations are strongly enriched in hormone receptor-positive (ER+/PR+) breast cancer, which is the least aggressive subtype and responds well to hormone therapies such as tamoxifen and aromatase inhibitors. Patients with ER+ tumors are more likely to achieve tumor-free status after treatment, which explains the higher PIK3CA mutation rate in the TUMOR FREE group.
+
+2. Targeted therapy: PIK3CA-mutant tumors can be treated with PI3K inhibitors such as alpelisib (Piqray), which is FDA-approved specifically for PIK3CA-mutant ER+ breast cancer. Patients with PIK3CA mutations may therefore benefit from more effective targeted treatments, increasing the likelihood of becoming tumor free.
+
+
+*3*
+Create a contingency table with your variable and chosen gene. Run a Fisher’s Exact Test between presence of mutations for that gene and your clinical variable. Create and save a mosaic plot. 
+Interpret the output of the Fisher’s Exact Test in terms of the odds ratio and p-value.
+```{r}
+chosen_gene <- "PIK3CA"
+
+# Subset MAF to get only patients with PIK3CA mutations
+PIK3CA_maf <- subsetMaf(maf = maf_object, genes = chosen_gene)
+
+# Label each patient as "mutation" or "no_mutation" for PIK3CA
+# Use %in% to check if each patient barcode appears in the PIK3CA MAF
+mutation_status <- ifelse(
+  maf_object@clinical.data$Tumor_Sample_Barcode %in% PIK3CA_maf@clinical.data$Tumor_Sample_Barcode,
+  "mutation",
+  "no_mutation"
+)
+
+valid_mask <- !is.na(maf_object@clinical.data$tumor_status)
+
+# Build contingency table
+# Rows (factor1) = mutation_status, Columns (factor2) = tumor_status
+contingency_table <- table(mutation_status[valid_mask],
+                           maf_object@clinical.data$tumor_status[valid_mask])
+print(contingency_table)
+
+# Create and save mosaic plot
+png("mosaic_PIK3CA_tumor_status.png", width = 700, height = 600)
+mosaicplot(contingency_table,
+           main = "PIK3CA Mutation Status vs Tumor Status",
+           xlab = "Mutation Status",
+           ylab = "Tumor Status")
+dev.off()
+
+# Display inline
+mosaicplot(contingency_table,
+           main = "PIK3CA Mutation Status vs Tumor Status",
+           xlab = "Mutation Status",
+           ylab = "Tumor Status")
+
+# Run Fisher's Exact Test
+fisher_result <- fisher.test(contingency_table)
+print(fisher_result)
+```
+Interpretation:
+
+Odds Ratio (OR = 0.681):
+The odds ratio of 0.681 means that the odds of having a PIK3CA mutation are 0.681 times lower in the WITH TUMOR group compared to the TUMOR FREE group. In other words, patients who are TUMOR FREE have approximately 1.47x higher odds (1/0.681) of carrying a PIK3CA mutation than patients who still have tumor. This is consistent with our co-oncoplot finding (Tumor Free: 35% vs With Tumor: 27%), and supports the hypothesis that PIK3CA mutations are enriched in ER+ breast cancer patients who respond better to treatment and are therefore more likely to achieve tumor-free status.
+
+P-value (p = 0.1432):
+The p-value of 0.1432 is greater than 0.05, meaning the association between PIK3CA mutation status and tumor status is not statistically significant. We fail to reject the null hypothesis that the true odds ratio equals 1. While the trend in the data (OR < 1) aligns with our biological hypothesis, we cannot conclude with statistical confidence that PIK3CA mutation status and tumor status are meaningfully associated in this dataset. This may be due to the relatively small number of WITH TUMOR patients (only 81 total), which limits the statistical power of the test.
+
+
+*4*
+Subset your maf_object based on your chosen clinical variable and create a co-lollipop plot of your chosen gene divided between the two different clinical variable possibilities. Include descriptive names on your plot.
+Do you notice any difference in terms of mutations (e.g. sites, types, number) between the two populations?
+```{r}
+# with_tumor_maf and tumor_free_maf were created in Exercise 1
+lollipopPlot2(m1 = with_tumor_maf,
+              m2 = tumor_free_maf,
+              m1_name = "With Tumor",
+              m2_name = "Tumor Free",
+              gene = chosen_gene)
+
+# Save the plot
+png("colollipop_PIK3CA_tumor_status.png", width = 1200, height = 700)
+lollipopPlot2(m1 = with_tumor_maf,
+              m2 = tumor_free_maf,
+              m1_name = "With Tumor",
+              m2_name = "Tumor Free",
+              gene = chosen_gene)
+dev.off()
+```
+Inspiration from the co-lollipop plot:
+
+Mutation Types:
+Both groups show exclusively Missense_Mutation and In_Frame_Del, with Missense_Mutation being overwhelmingly dominant in both populations. There is no notable difference in mutation types between the two groups.
+
+Number of Mutations:
+The Tumor Free group has a substantially higher mutation rate (35.45%, N = 773) compared to the With Tumor group (27.16%, N = 81). This large difference in sample size makes direct comparison difficult, but the higher percentage in the Tumor Free group is consistent with our Fisher's Exact Test result (OR = 0.681) and co-oncoplot finding, suggesting PIK3CA mutations are more prevalent in patients who achieved tumor-free status.
+
+Mutation Sites:
+Both groups share the same prominent hotspot at the far right end of the protein (around amino acid 1047), which corresponds to the well-known H1047R hotspot located in the kinase domain (PI3Ka_I). This is the most common gain-of-function PIK3CA mutation in breast cancer. The similar distribution of mutation sites across both groups suggests that the same hotspot mutations occur regardless of tumor status, and the difference between groups is more about frequency than location.
+
+*5*
+Create your Overall_Survival_Status column and create a mafSurvival KM plot based on mutations in your chosen gene.
+Does there seem to be a difference? Hypothesize why or not based on the other analysis you did with the gene above.
+```{r}
+# Create Overall_Survival_Status boolean column
+# TRUE = Alive, FALSE = Dead (required format for mafSurvival)
+maf_object@clinical.data$Overall_Survival_Status <- ifelse(
+  maf_object@clinical.data$vital_status == "Alive", TRUE, FALSE
+)
+
+# Confirm
+table(maf_object@clinical.data$Overall_Survival_Status)
+
+# Create mafSurvival KM plot for PIK3CA
+mafSurvival(maf = maf_object,
+            genes = chosen_gene,
+            time = "last_contact_days_to",
+            Status = "Overall_Survival_Status",
+            isTCGA = TRUE)
+
+# Save the plot
+png("survival_PIK3CA_mutant_vs_WT.png", width = 900, height = 700)
+mafSurvival(maf = maf_object,
+            genes = chosen_gene,
+            time = "last_contact_days_to",
+            Status = "Overall_Survival_Status",
+            isTCGA = TRUE)
+dev.off()
+```
+Does there seem to be a difference?
+No. The two survival curves for PIK3CA Mutant (N = 301) and Wild-Type (N = 571) are nearly identical throughout the entire follow-up period. The p-value of 0.755 is far greater than 0.05, meaning the difference is not statistically significant. The hazard ratio (HR = 1.02) is essentially 1, indicating that PIK3CA mutation status confers almost no difference in the risk of death compared to wild-type patients.
+
+Hypothesis:
+This result is consistent with our previous analyses. In our Fisher's Exact Test (Exercise 3), the association between PIK3CA mutation and tumor status was also not statistically significant (p = 0.1432), suggesting that PIK3CA mutation status does not strongly distinguish patient outcomes on its own. While PIK3CA mutations are enriched in the TUMOR FREE group (35% vs 27% in Exercise 2), this likely reflects the underlying association between PIK3CA mutations and the ER+ breast cancer subtype, which has better treatment response — rather than PIK3CA mutation directly improving survival. In other words, it is the tumor subtype and treatment (e.g. hormone therapy, alpelisib) that drive better outcomes, not the PIK3CA mutation itself.
