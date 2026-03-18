@@ -1,0 +1,334 @@
+---
+title: "Intro_to_Epigenomics"
+author: "Ke (Dan) Wang"
+date: "Spring 2026"
+---
+
+# Setup
+
+```{r setup}
+#setwd("/home1/kwang895/490_cluster/analysis_data")
+getwd()
+knitr::opts_knit$set(root.dir = normalizePath("/home1/kwang895/490_cluster/analysis_data"))
+```
+
+```{r install packages}
+if (!require("sesameData", quietly = TRUE))
+  BiocManager::install("sesameData")
+
+if (!require("sesame", quietly = TRUE))
+  BiocManager::install("sesame")
+
+if (!require("limma", quietly = TRUE))
+  BiocManager::install("limma")
+```
+
+```{r load packages}
+library(TCGAbiolinks)
+library(sesame)
+library(sesameData)
+library(limma)
+library(ggplot2)
+```
+
+```{r Query, Download, and Prepare the data}
+query <- GDCquery(project = "TCGA-BRCA",
+                  data.category = "DNA Methylation",
+                  data.type = "Methylation Beta Value",
+                  platform = "Illumina Human Methylation 450",
+                  data.format = "Dataframe")
+#GDCdownload(query)     <-- you will need to run this once!
+methylation450 <- GDCprepare(query)
+```
+
+```{r extract dataframes from methylation450}
+methylation_clinical <- as.data.frame(methylation450@colData)
+betas <- as.data.frame(methylation450@assays@data@listData)  #takes a longer time
+cpg_sites <- as.data.frame(methylation450@rowRanges@elementMetadata)
+
+column_mask <- ifelse(colnames(methylation_clinical) %in% c('treatments',
+                      'primary_site', 'disease_type', 'sites_of_involvement'), F, T)
+methylation_clinical <- methylation_clinical[, column_mask]
+write.csv(methylation_clinical, 'brca_methylation_clinical.csv')
+
+# filter out probes with ambiguous gene annotations (contain '-' or ';') and NAs
+site_mask <- !grepl('-', cpg_sites$gene) & !grepl(';', cpg_sites$gene) &
+             !is.na(cpg_sites$gene) & complete.cases(betas)
+betas <- betas[site_mask, ]
+cpg_sites <- cpg_sites[site_mask, ]
+
+write.csv(betas, 'brca_methylation_betas.csv')  #takes a longer time
+write.csv(cpg_sites, 'brca_cpg_sites.csv')
+```
+
+Use the code below if you are loading in your data (i.e. you downloaded the data
+and closed the session, but you are back to continue working)
+
+```{r load saved data}
+methylation_clinical <- read.csv('brca_methylation_clinical.csv', row.names = 1)
+betas <- read.csv('brca_methylation_betas.csv', row.names = 1)
+cpg_sites <- read.csv('brca_cpg_sites.csv', row.names = 1)
+```
+
+---
+
+# (1) Naive Differential Methylation — Volcano Plot
+
+Per the homework instructions, metastasis status is based on the definition column.
+We only consider "Metastatic" or "Primary solid Tumor" samples.
+
+```{r filter to metastatic and primary tumor samples only}
+# Keep only Metastatic and Primary solid Tumor samples
+definition_mask <- methylation_clinical$definition %in%
+                   c("Metastatic", "Primary solid Tumor")
+methylation_clinical <- methylation_clinical[definition_mask, ]
+betas_clean <- betas[, definition_mask]
+```
+
+```{r create metastatic status variable}
+# Create metastatic status column: Metastatic vs Non-Metastatic (Primary solid Tumor)
+methylation_clinical$metastatic_status <- ifelse(
+  methylation_clinical$definition == "Metastatic", "Metastatic", "Non-Metastatic"
+)
+
+# Define comparison and base group
+# Non-Metastatic = base group, Metastatic = comparison group
+non_metastatic_mask <- methylation_clinical$metastatic_status == "Non-Metastatic"
+methylation_clinical$metastatic <- !non_metastatic_mask
+```
+
+```{r fit linear model on M-values}
+# Convert beta values to M-values for linear modeling
+# M-value = log2(beta / (1 - beta)), centered at 0, more statistically appropriate
+mval <- t(apply(betas_clean, 1, function(x) log2(x/(1-x))))
+# this step will take a few seconds to run
+
+design <- model.matrix(~ metastatic, data = methylation_clinical)
+fit  <- lmFit(mval, design)
+fit2 <- eBayes(fit)
+```
+
+```{r extract results into dataframe}
+# Extracting model into dataframe
+dat <- data.frame(
+  foldchange = fit[["coefficients"]][, 2],
+  logPvalue  = -log10(p.adjust(fit2[["p.value"]][, 2], method = 'BY')),
+  geneName   = cpg_sites$gene
+)
+dat$threshold <- as.factor(abs(dat$foldchange) < 1)
+```
+
+```{r}
+colnames(betas_clean) <- gsub("\\.", "-", colnames(betas_clean))
+```
+
+
+```{r volcano plot}
+# Visualization
+cols <- c("TRUE" = "grey", "FALSE" = "blue")
+
+ggplot(data = dat, aes(x = foldchange, y = logPvalue)) +
+  geom_point(alpha = .2, size = 0.6) +
+  scale_colour_manual(values = cols) +
+  geom_vline(xintercept =  1, colour = "#990000", linetype = "dashed") +
+  geom_vline(xintercept = -1, colour = "#990000", linetype = "dashed") +
+  geom_hline(yintercept =  2, colour = "#990000", linetype = "dashed") +
+  theme(legend.position = "none") +
+  xlab("Fold Change") +
+  ylab("-log10 p value") +
+  theme_bw() +
+  theme(legend.position = "none") +
+  ggtitle("Naive Differential Methylation: Metastatic vs Non-Metastatic BRCA")
+
+# Saving results to a .csv file
+write.csv(dat, "methylation_results_metastatic.csv")
+```
+
+# Part 1 Description:
+The volcano plot reveals that the majority of CpG sites show little to no statistically significant differential methylation between metastatic and non-metastatic BRCA patients, as most points cluster near a log p-value of 0. A notable asymmetry is observed, with more sites showing hypomethylation (negative fold change) than hypermethylation in metastatic patients, particularly several sites with fold change below -2 that exceed the significance threshold. However, we cannot conclude that these methylation differences are directly caused by metastatic status, as this is a naive analysis that does not control for confounders such as age, tumor purity, or PAM50 subtype. Additionally, the severe sample size imbalance between metastatic (very few) and non-metastatic (majority) patients limits the statistical power of this comparison.
+
+First, run DESeq2 to generate differential expression results.
+
+```{r}
+if (!require("DESeq2", quietly = TRUE))
+  BiocManager::install("DESeq2")
+
+library(DESeq2)
+```
+
+```{r load rna data for DESeq2}
+rna_clinical <- read.csv("brca_rna_clinical_data.csv", row.names = 1)
+rna_genes    <- read.csv("brca_rna_gene_data.csv")
+rna_counts   <- read.csv("brca_rna_count_data.csv", row.names = 1)
+```
+
+```{r DESeq2 preprocessing}
+# Filter to only Metastatic and Primary solid Tumor (same as methylation)
+definition_mask <- rna_clinical$definition %in% c("Metastatic", "Primary solid Tumor")
+rna_clinical <- rna_clinical[definition_mask, ]
+rna_counts   <- rna_counts[, definition_mask]
+
+# Create metastatic_status factor; Non-Metastatic = base group
+rna_clinical$metastatic_status <- factor(
+  ifelse(rna_clinical$definition == "Metastatic", "Metastatic", "Non-Metastatic"),
+  levels = c("Non-Metastatic", "Metastatic")
+)
+
+# Control covariate: age_category
+rna_clinical$age_category <- factor(
+  ifelse(rna_clinical$age_at_index >= 58, "old", "young")
+)
+
+# Remove NAs in age
+na_mask      <- !is.na(rna_clinical$age_at_index)
+rna_clinical <- rna_clinical[na_mask, ]
+rna_counts   <- rna_counts[, na_mask]
+
+# Filter low-expression genes (total counts < 20, per homework instructions)
+keep_genes        <- rowSums(rna_counts) >= 20
+rna_counts        <- rna_counts[keep_genes, ]
+rna_genes_filtered <- rna_genes[keep_genes, ]
+
+# Fix barcodes: replace "." with "-" to match methylation data
+colnames(rna_counts) <- gsub("\\.", "-", colnames(rna_counts))
+all(colnames(rna_counts) == rownames(rna_clinical))
+
+cat("Patients remaining:", ncol(rna_counts), "\n")
+table(rna_clinical$metastatic_status)
+```
+
+```{r run DESeq2}
+dds <- DESeqDataSetFromMatrix(countData = rna_counts,
+                              colData   = rna_clinical,
+                              design    = ~ age_category + metastatic_status)
+
+dds_obj <- DESeq(dds)
+```
+
+```{r}
+resultsNames(dds_obj)
+
+results <- results(dds_obj,
+                   format   = "DataFrame",
+                   contrast = c("metastatic_status", "Metastatic", "Non-Metastatic"))
+
+results <- data.frame(results)
+results$gene_name <- rna_genes_filtered$gene_name
+
+write.csv(results, "deSeq_results_metastatic.csv", row.names = TRUE)
+
+deseq_results <- read.csv("deSeq_results_metastatic.csv")
+```
+
+```{r}
+downregulated <- deseq_results[deseq_results$padj < 0.05 &
+                                deseq_results$log2FoldChange < -1, 'gene_name']
+hypermethylated <- dat[dat$foldchange > 2, 'geneName'] #what cutoff should you use here?
+interest_genes <- intersect(downregulated, hypermethylated)
+```
+
+
+```{r explore gene of interest}
+# Choose one gene from interest_genes (or pick your own based on biological relevance)
+GENE <- "KDM4B"
+
+gene_counts_mask <- rna_genes$gene_name == GENE
+gene_betas_mask  <- cpg_sites$gene == GENE
+```
+
+```{r create group masks}
+# RNA: identify which samples belong to each group (using rna_clinical)
+rna_meta_mask    <- rna_clinical$metastatic_status == "Metastatic"
+rna_nonmeta_mask <- rna_clinical$metastatic_status == "Non-Metastatic"
+
+# Methylation: identify which samples belong to each group (using methylation_clinical)
+meth_meta_mask    <- methylation_clinical$metastatic_status == "Metastatic"
+meth_nonmeta_mask <- methylation_clinical$metastatic_status == "Non-Metastatic"
+```
+
+```{r extract expression and methylation data for gene}
+# Extract expression values for KDM4B
+rna_meta    <- as.numeric(rna_counts[gene_counts_mask, rna_meta_mask])
+rna_nonmeta <- as.numeric(rna_counts[gene_counts_mask, rna_nonmeta_mask])
+
+# Extract beta values for KDM4B CpG sites
+methylation_meta    <- betas_clean[gene_betas_mask, meth_meta_mask]
+methylation_nonmeta <- betas_clean[gene_betas_mask, meth_nonmeta_mask]
+```
+
+```{r box plot RNA expression}
+boxplot(rna_nonmeta, rna_meta,
+        xlab = 'Group', ylab = 'Counts',
+        names = c('Non-Metastatic', 'Metastatic'),
+        col = c("blue", "red"),
+        main = paste("RNA Expression of", GENE, ": Metastatic vs Non-Metastatic BRCA"))
+```
+
+```{r bar plot methylation at CpG sites}
+# Show methylation differences at CpG sites in this gene
+plot(1:dim(methylation_nonmeta)[1], apply(methylation_nonmeta, 1, mean),
+     col = 'blue', type = 'h', lwd = 3,
+     ylab = 'Average Beta', xlab = 'CpG sites',
+     main = paste("CpG Methylation at", GENE, ": Metastatic vs Non-Metastatic BRCA"))
+
+lines(1.3:(dim(methylation_meta)[1]+0.3), apply(methylation_meta, 1, mean),
+      col = 'red', type = 'h', lwd = 3)
+
+legend("topright",
+       legend = c("Non-Metastatic", "Metastatic"),
+       col = c("blue", "red"),
+       lwd = 3,
+       cex = 0.7)
+```
+
+# Part 2 Description:
+The box plot shows that KDM4B RNA expression is slightly higher in metastatic patients compared to non-metastatic patients, though there is substantial overlap in the interquartile ranges between the two groups. The CpG methylation bar plot demonstrates that beta values at most KDM4B CpG sites are largely similar between metastatic and non-metastatic patients, with only subtle differences visible at a few individual sites. These results are inconsistent with the classic promoter hypermethylation-mediated silencing model, since we would expect higher methylation to correlate with lower expression in metastatic patients. Therefore, we cannot conclude that KDM4B transcription is regulated by DNA methylation in the context of metastasis in this dataset, and other regulatory mechanisms may be responsible for the observed expression differences.
+
+---
+
+# (3) UCSC Genome Browser Visualization — 3 Genes
+
+KDM4B:
+The UCSC genome browser shows that KDM4B spans a large genomic region on chromosome 19p13.3, with a prominent CpG island (CpG: 144) located at the 5' end of the gene overlapping the annotated EPDnew promoter, which is the most likely regulatory region for transcriptional control. UniProt annotations reveal that KDM4B contains well-defined protein domains in the 3' portion of the gene, consistent with its role as a histone demethylase. The large CpG: 144 island at the promoter suggests that methylation at this region could plausibly silence KDM4B transcription; however, our data showed higher expression in metastatic patients despite hypermethylation, which does not support the canonical promoter silencing model. This discrepancy may reflect the fact that the specific CpG sites captured by the 450k array do not correspond to the functionally critical promoter CpG island, or that other regulatory mechanisms dominate KDM4B expression in this context.
+
+MAPT:
+MAPT is located on chromosome 17q21.31 in a region flagged by UCSC as containing unusual assembly structure, with multiple alternate haplotype alignments visible, reflecting the known genomic complexity of this locus due to a large inversion polymorphism. A large CpG island (CpG: 320) is present at the 5' promoter region with an EPDnew-annotated promoter, while two smaller CpG islands (CpG: 26, CpG: 21) are distributed across the gene body. UniProt annotations show that the MAPT protein contains microtubule-binding repeat domains concentrated toward the 3' end of the gene. The presence of a large promoter-associated CpG island supports the possibility that DNA methylation could regulate MAPT expression in breast cancer, and the genomic complexity of this locus suggests that methylation patterns here may vary substantially across patient subgroups, limiting the generalizability of conclusions drawn from bulk tumor data.
+
+COL18A1:
+COL18A1 spans a large region on chromosome 21q22.3 and displays a prominent CpG island (CpG: 137) at the 5' promoter end co-localizing with an EPDnew-annotated promoter and a strong H3K27Ac signal, indicating an actively regulated chromatin region. UniProt annotations highlight a signal peptide at the N-terminus followed by extensive extracellular domain annotations, consistent with its function as a secreted collagen whose C-terminal endostatin domain acts as an angiogenesis inhibitor. Multiple additional CpG islands are distributed throughout the gene body (CpG: 75, 49, 108, etc.), suggesting that methylation at different regions could have distinct regulatory consequences beyond simple promoter silencing. Given that endostatin suppresses tumor angiogenesis and thereby inhibits metastasis, hypermethylation and silencing of COL18A1 in metastatic tumors would be biologically consistent with a pro-metastatic epigenetic program, making it a compelling candidate for further functional validation.
+
+
+**Analysis with articles published:
+
+Our analysis found that KDM4B is hypermethylated yet shows higher expression in metastatic compared to non-metastatic BRCA patients, which is inconsistent with the canonical promoter methylation silencing model. The following three articles collectively address this discrepancy from different angles.
+
+Article 1 (does NOT support our conclusion): Wang et al. (2024, Molecular and Cellular Biochemistry) reported that KDM4B was down-regulated in human primary BRCA tissues and low levels of KDM4B expression were correlated with poor survival; gain- and loss-of-function experiments showed that KDM4B inhibited the proliferation and metastasis of breast cancer cells, and knockdown of KDM4B promoted epithelial-mesenchymal transition (EMT) and cell stemness. PubMed This directly contradicts our observation of higher KDM4B expression in metastatic patients, as their findings suggest KDM4B should act as a metastasis suppressor and thus be downregulated in more aggressive tumors.
+
+Article 2 (partially supports our conclusion): Liu et al. (2015, PubMed/ResearchGate) conducted a meta-analysis of KDM4 subfamily in breast cancer and found that KDM4B overexpression is more dominant in estrogen-receptor-positive, luminal breast cancer PubMed, rather than in aggressive metastatic subtypes. This is consistent with our finding of relatively higher KDM4B expression in the metastatic group only if the metastatic samples in TCGA happen to be enriched for ER-positive tumors, but it also highlights that KDM4B's expression pattern is highly subtype-dependent, limiting the conclusions we can draw from bulk comparisons.
+
+Article 3 (does NOT support our conclusion): Young et al. (2013, Journal of Biological Chemistry) reported that KDM4B is overexpressed in several tumor types and is oncogenic upon overexpression, and that the oncogenic capacity of KDM4 proteins and the association of decreased H3K9 methylation with poor patient outcomes suggests that KDM4 overexpression is clinically relevant to cancer progression. ScienceDirect While this article frames KDM4B overexpression as oncogenic (which could partially align with higher expression in metastatic patients), it does not support our original methylation-driven silencing hypothesis, since it suggests KDM4B should be overexpressed rather than silenced in aggressive tumors.
+
+There are several reasons why our analysis may not align with this published work: first, our comparison uses bulk RNA-seq counts without normalization for tumor purity, and the metastatic group in TCGA-BRCA contains very few samples (only ~20) compared to over 1000 non-metastatic samples, making the statistical comparison underpowered and susceptible to outlier-driven inflation. Second, KDM4B is broadly defined as playing key roles in processes related to tumorigenesis including cell proliferation, cell survival, and metastasis PubMed Central, suggesting its role is highly context-dependent and may differ across breast cancer subtypes such as ER-positive vs. triple-negative, which are not separated in our bulk analysis.
+
+Recources:
+
+Article 1
+Title: KDM4B down-regulation facilitated breast cancer cell stemness via PHGDH upregulation in H3K36me3-dependent manner
+Authors: Wang, X.Y., Li, H.M., Xia, R. et al.
+Journal: Molecular and Cellular Biochemistry
+Year: 2024
+DOI/Link: https://pubmed.ncbi.nlm.nih.gov/37249813/
+
+Article 2
+Title: Genetic alterations of KDM4 subfamily and therapeutic effect of novel demethylase inhibitor in breast cancer
+Authors: Liu, G. et al.
+Journal: published on PubMed / ResearchGate
+Year: 2015
+DOI/Link: https://pubmed.ncbi.nlm.nih.gov/26101715/
+
+Article 3
+Title: Kdm4b Histone Demethylase Is a DNA Damage Response Protein and Confers a Survival Advantage following γ-Irradiation
+Authors: Young, L.C., McDonald, D.W., Hendzel, M.J.
+Journal: Journal of Biological Chemistry
+Year: 2013
+DOI/Link: https://www.sciencedirect.com/science/article/pii/S002192582045570X
